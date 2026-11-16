@@ -1,7 +1,7 @@
 {
   "name": "ZizysBot",
   "version": "1.5.0",
-  "description": "Bot de comandos para WhatsApp usando a biblioteca velowa",
+  "description": "Um bot que toca músicas em call do WhatsApp",
   "type": "module",
   "main": "index.js",
   "scripts": {
