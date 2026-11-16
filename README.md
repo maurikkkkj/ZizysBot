@@ -2,9 +2,7 @@
 Um bot que toca músicas em call do WhatsApp
 
 ---
-
-## 📦 Instalação
-
+## 📦 Instalação + Execução
 ```bash
 git clone https://github.com/maurikkkkj/ZizysBot
 cd ZizysBot
