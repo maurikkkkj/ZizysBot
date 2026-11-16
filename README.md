@@ -8,6 +8,7 @@ git clone https://github.com/maurikkkkj/ZizysBot
 cd ZizysBot
 npm install
 npm start
+```
 
 ---
 👍 Esse bot é tão leve que vai rodar na sua maquina ou na sua bomba de celular via termux.
