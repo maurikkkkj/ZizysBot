@@ -1,6 +1,6 @@
 {
-  "name": "velowa-bot",
-  "version": "1.0.0",
+  "name": "ZizysBot",
+  "version": "1.5.0",
   "description": "Bot de comandos para WhatsApp usando a biblioteca velowa",
   "type": "module",
   "main": "index.js",
