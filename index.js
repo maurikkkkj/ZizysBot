@@ -64,6 +64,12 @@ const DIRECT_END_MARGIN_MS = 4_000
 const DEBUG_CALLS = false
 const USER_AGENT = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36'
 
+const STICKER_SIZE = 512
+const STICKER_MAX_SECONDS = 15
+const STICKER_MAX_BYTES = 1024 * 1024
+const STICKER_MAX_INPUT_BYTES = 20 * 1024 * 1024
+const MENTION_MAX_CHARS = 1000
+
 const SAMPLE_RATE = 48_000
 const FALLBACK_RATE = 16_000
 const CHUNK_SAMPLES = SAMPLE_RATE / 2
@@ -240,7 +246,7 @@ async function workerEntry() {
 if (!isMainThread) {
   await workerEntry()
 } else {
-  const { Client, ProtocolLogger, areJidsSameUser, serialize } = await import('velowa')
+  const { Client, ProtocolLogger, GroupCache, areJidsSameUser, isGroupAdmin, serialize } = await import('velowa')
 
   const client = new Client({
     authDir: 'auth',
@@ -1120,6 +1126,222 @@ if (!isMainThread) {
     await say(m, { image, caption: '✅ Pronto!' })
   }
 
+  // ---------- Comandos de grupo ----------
+  const groups = new GroupCache(client)
+
+  const isBotAdmin = (group) => {
+    const me = client.me
+    if (!me) return false
+    return isGroupAdmin(group, me.id) || (!!me.lid && isGroupAdmin(group, me.lid))
+  }
+
+  async function groupAdminContext(m, { needBotAdmin = true } = {}) {
+    if (!m.isGroup) {
+      await say(m, 'Esse comando só funciona em grupos.')
+      return null
+    }
+    const group = await groups.get(m.chat)
+    if (!isSelf(m) && !isGroupAdmin(group, m.sender)) {
+      await say(m, '🚫 Só admins do grupo podem usar esse comando.')
+      return null
+    }
+    if (needBotAdmin && !isBotAdmin(group)) {
+      await say(m, '⚠️ Preciso ser admin do grupo para fazer isso.')
+      return null
+    }
+    return group
+  }
+
+  function memberTargets(m) {
+    const list = [...(m.mentionedJids ?? [])]
+    if (!list.length && m.quoted?.sender) list.push(m.quoted.sender)
+    const seen = new Set()
+    return list.filter((jid) => {
+      const key = numberOf(jid)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }
+
+  const tagList = (jids) => jids.map((j) => `@${numberOf(j)}`).join(', ')
+
+  async function changeMembers(m, action, { usage, filter, done, nothing }) {
+    const group = await groupAdminContext(m)
+    if (!group) return
+
+    const all = memberTargets(m)
+    if (!all.length) {
+      await say(m, `Use: ${PREFIX}${usage}  (marque o membro ou responda a mensagem dele)`)
+      return
+    }
+
+    const targets = all.filter((jid) => !isMe(jid) && filter(group, jid))
+    if (!targets.length) {
+      await say(m, nothing)
+      return
+    }
+
+    await client.groups.updateParticipants(m.chat, targets, action)
+    await say(m, { text: `${done} ${tagList(targets)}`, mentions: targets })
+  }
+
+  const removeCmd = (m) =>
+    changeMembers(m, 'remove', {
+      usage: 'remover @membro',
+      filter: () => true,
+      done: '🚪 Removido(s):',
+      nothing: 'Não posso remover esse membro.',
+    })
+
+  const promoteCmd = (m) =>
+    changeMembers(m, 'promote', {
+      usage: 'promover @membro',
+      filter: (group, jid) => !isGroupAdmin(group, jid),
+      done: '⭐ Agora é admin:',
+      nothing: 'Esse membro já é admin do grupo.',
+    })
+
+  const demoteCmd = (m) =>
+    changeMembers(m, 'demote', {
+      usage: 'rebaixar @membro',
+      filter: (group, jid) => isGroupAdmin(group, jid),
+      done: '⬇️ Não é mais admin:',
+      nothing: 'Esse membro não é admin do grupo.',
+    })
+
+  async function reportCmd(m) {
+    if (!m.isGroup) {
+      await say(m, 'Esse comando só funciona em grupos.')
+      return
+    }
+    if (!m.quoted?.id) {
+      await say(m, `Responda a mensagem que você quer reportar com ${PREFIX}reportar`)
+      return
+    }
+    await client.reportToAdmins(m.chat, m.quoted.id)
+    await say(m, '🚨 Mensagem reportada para os admins do grupo.')
+  }
+
+  const participantJid = (p) => {
+    const jid = typeof p === 'string' ? p : p?.phoneNumber || p?.id
+    if (!jid) return null
+    return String(jid).includes('@') ? String(jid) : `${jid}@s.whatsapp.net`
+  }
+
+  async function mentionAllCmd(m) {
+    const group = await groupAdminContext(m, { needBotAdmin: false })
+    if (!group) return
+
+    const text = m.text.replace(/^\S+\s*/, '').trim()
+    if (!text) {
+      await say(m, `Use: ${PREFIX}mencionar texto`)
+      return
+    }
+    if (text.length > MENTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${MENTION_MAX_CHARS} caracteres).`)
+      return
+    }
+
+    const mentions = [...new Set((group.participants ?? []).map(participantJid).filter(Boolean))]
+    await client.send(chatOf(m), { text, mentions })
+  }
+
+  // ---------- /sticker ----------
+  const looksLikeVideo = (x) => {
+    if (!x) return false
+    const mime = String(x.mimetype ?? x.mime ?? x.msg?.mimetype ?? '').toLowerCase()
+    const type = String(x.mtype ?? x.type ?? x.messageType ?? '').toLowerCase()
+    return mime.startsWith('video/') || type.includes('video')
+  }
+
+  const mimeOf = (x) => String(x?.mimetype ?? x?.mime ?? x?.msg?.mimetype ?? '').toLowerCase()
+
+  async function getStickerSource(m) {
+    const sources = [m.quoted, m].filter((x) => looksLikeImage(x) || looksLikeVideo(x))
+    for (const src of sources) {
+      const buffer = await downloadFrom(src)
+      if (buffer) return { buffer, video: looksLikeVideo(src), mime: mimeOf(src) }
+    }
+    return null
+  }
+
+  function mediaDuration(file) {
+    const r = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file], {
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+    if (r.error || r.status !== 0) return 0
+    return Number(String(r.stdout).trim()) || 0
+  }
+
+  function runStickerFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+      const p = spawn('ffmpeg', ['-v', 'error', '-nostdin', '-y', ...args], { stdio: ['ignore', 'ignore', 'pipe'] })
+      let err = ''
+      p.stderr.on('data', (b) => {
+        if (err.length < 2000) err += b.toString()
+      })
+      p.on('error', (e) => reject(new UserError(`Não consegui iniciar o ffmpeg: ${e.message}`)))
+      p.on('close', (code) => {
+        if (code !== 0) return reject(new Error(`O ffmpeg falhou: ${err.trim() || code}`))
+        resolve()
+      })
+    })
+  }
+
+  async function makeSticker({ buffer, video, mime }) {
+    if (!hasFfmpeg()) throw new UserError('O ffmpeg não está instalado. No Termux: pkg install ffmpeg')
+
+    fs.mkdirSync(MEDIA_DIR, { recursive: true })
+    const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
+    const ext = video ? 'mp4' : mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : mime.includes('gif') ? 'gif' : 'jpg'
+    const input = path.join(MEDIA_DIR, `sticker-${id}.${ext}`)
+    const output = path.join(MEDIA_DIR, `sticker-${id}.webp`)
+    fs.writeFileSync(input, buffer)
+
+    try {
+      if (video) {
+        const duration = mediaDuration(path.resolve(input))
+        if (duration > STICKER_MAX_SECONDS + 0.5) {
+          throw new UserError(`O vídeo tem ${Math.round(duration)}s e o limite é de ${STICKER_MAX_SECONDS}s.`)
+        }
+      }
+
+      const size = STICKER_SIZE
+      const fit = `scale=${size}:${size}:force_original_aspect_ratio=decrease,format=rgba,pad=${size}:${size}:(ow-iw)/2:(oh-ih)/2:color=#00000000`
+      const qualities = video ? [55, 40, 28, 18] : [80, 60, 40]
+
+      for (const q of qualities) {
+        const args = video
+          ? ['-i', input, '-t', String(STICKER_MAX_SECONDS), '-vf', `fps=15,${fit}`, '-an', '-c:v', 'libwebp', '-loop', '0', '-q:v', String(q), '-compression_level', '6', output]
+          : ['-i', input, '-vf', fit, '-frames:v', '1', '-c:v', 'libwebp', '-q:v', String(q), output]
+        await runStickerFfmpeg(args)
+        const out = fs.readFileSync(output)
+        if (out.length <= STICKER_MAX_BYTES) return out
+      }
+      throw new UserError('Não consegui deixar a figurinha leve o bastante. Tente um vídeo menor ou mais curto.')
+    } finally {
+      fs.rmSync(input, { force: true })
+      fs.rmSync(output, { force: true })
+    }
+  }
+
+  async function stickerCmd(m) {
+    const src = await getStickerSource(m)
+    if (!src) {
+      await say(m, `Responda uma foto, vídeo ou gif com ${PREFIX}sticker, ou envie a mídia com ${PREFIX}sticker na legenda. (vídeo e gif até ${STICKER_MAX_SECONDS}s)`)
+      return
+    }
+    if (src.buffer.length > STICKER_MAX_INPUT_BYTES) {
+      await say(m, 'A mídia é grande demais.')
+      return
+    }
+    await say(m, '🖼️ Criando a figurinha…')
+    const sticker = await makeSticker(src)
+    await say(m, { sticker })
+  }
+
   // ---------- Comandos ----------
   async function handleCommand(m, command, args) {
     switch (command) {
@@ -1197,7 +1419,25 @@ Comando: *${PREFIX}gun <texto>*
 Coloca uma arma sobre a imagem com o texto. Responda uma imagem ou envie com o comando.
 
 Comando: *${PREFIX}mock <texto>*
-Transforma o texto em tom sarcástico.`
+Transforma o texto em tom sarcástico.
+
+Comando: *${PREFIX}sticker*
+Cria uma figurinha de foto, vídeo ou gif (até ${STICKER_MAX_SECONDS}s). Responda a mídia ou envie com o comando.
+
+Comando: *${PREFIX}reportar*
+Reporta uma mensagem para os admins do grupo. Responda a mensagem que quer reportar.
+
+Comando: *${PREFIX}remover @membro*
+Remove um membro do grupo. Só admins. Marque o membro ou responda a mensagem dele.
+
+Comando: *${PREFIX}promover @membro*
+Promove um membro a admin do grupo. Só admins. Marque o membro ou responda a mensagem dele.
+
+Comando: *${PREFIX}rebaixar @membro*
+Tira o admin de um membro do grupo. Só admins. Marque o membro ou responda a mensagem dele.
+
+Comando: *${PREFIX}mencionar <texto>*
+Menciona todos os membros do grupo de forma invisível, mostrando só o texto. Só admins.`
         await say(m, menuText)
         break
       }
@@ -1276,6 +1516,31 @@ Transforma o texto em tom sarcástico.`
 
       case 'mock':
         await textReplyCmd(m, args, 'mock', 'mock texto')
+        break
+
+      case 'sticker':
+      case 'figurinha':
+        await stickerCmd(m)
+        break
+
+      case 'remover':
+        await removeCmd(m)
+        break
+
+      case 'promover':
+        await promoteCmd(m)
+        break
+
+      case 'rebaixar':
+        await demoteCmd(m)
+        break
+
+      case 'reportar':
+        await reportCmd(m)
+        break
+
+      case 'mencionar':
+        await mentionAllCmd(m)
         break
 
       case 'pause':
