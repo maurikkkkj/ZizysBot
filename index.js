@@ -2,11 +2,31 @@ import 'dotenv/config'
 import { spawn, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import path from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
 import qrcode from 'qrcode-terminal'
+
+const IGNORED_FSYNC_CODES = new Set(['EPERM', 'EINVAL', 'EBADF'])
+
+const realFsyncSync = fs.fsyncSync
+fs.fsyncSync = (fd) => {
+  try {
+    return realFsyncSync(fd)
+  } catch (err) {
+    if (IGNORED_FSYNC_CODES.has(err?.code)) return
+    throw err
+  }
+}
+
+const realFsync = fs.fsync
+fs.fsync = (fd, cb) => {
+  realFsync(fd, (err) => cb(err && IGNORED_FSYNC_CODES.has(err.code) ? null : err))
+}
+
+syncBuiltinESMExports()
 
 // ---------- Configuração ----------
 const PREFIX = '/'
@@ -16,6 +36,11 @@ const MAX_MESSAGE_AGE_SECONDS = 120
 const OWNERS = (process.env.OWNER || '').split(',').map((s) => s.trim()).filter(Boolean)
 
 const API_URL = 'https://api.ikyyxd.my.id/search/ytplayv4?q='
+const IMGBB_KEY = '7058e8779e7ed461e566789ad41d6966'
+const IMGBB_URL = 'https://api.imgbb.com/1/upload'
+const CAPTION_API_URL = 'https://api.popcat.xyz/v2/caption'
+const CAPTION_MAX_CHARS = 200
+const CAPTION_MAX_IMAGE_BYTES = 16 * 1024 * 1024
 const MEDIA_DIR = 'media'
 const MAX_DURATION = Math.min(Math.max(Number(process.env.MAX_DURACAO) || 600, 10), 3600)
 const KEEP_AUDIOS = process.env.MANTER_AUDIOS === 'true'
@@ -32,7 +57,7 @@ const MAX_SESSION_MS = 3 * 60 * 60_000
 const PAUSE_TIMEOUT_MS = 10 * 60_000
 const GROUP_CALL_TTL_MS = 6 * 60 * 60_000
 const NORMALIZE_AUDIO = true
-const DIRECT_PLAY = true
+const DIRECT_PLAY = false
 const DIRECT_END_MARGIN_MS = 4_000
 const DEBUG_CALLS = false
 const USER_AGENT = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36'
@@ -221,32 +246,17 @@ if (!isMainThread) {
     antiban: true,
   })
 
-  process.on('unhandledRejection', (err) => console.error('Erro não tratado:', err))
-  process.on('uncaughtException', (err) => console.error('Exceção não tratada:', err))
+  const isFsyncPermError = (err) => !!err && err.syscall === 'fsync' && IGNORED_FSYNC_CODES.has(err.code)
 
-  // ---------- Modo de uso ----------
-  const MODE_FILE = 'data/modo.json'
+  process.on('unhandledRejection', (err) => {
+    if (isFsyncPermError(err)) return
+    console.error('Erro não tratado:', err)
+  })
 
-  function loadMode() {
-    try {
-      const saved = JSON.parse(fs.readFileSync(MODE_FILE, 'utf8')).modo
-      if (saved === 'self' || saved === 'publico') return saved
-    } catch {}
-    return process.env.MODO === 'self' ? 'self' : 'publico'
-  }
-
-  function saveMode(value) {
-    mode = value
-    try {
-      fs.mkdirSync('data', { recursive: true })
-      fs.writeFileSync(MODE_FILE, JSON.stringify({ modo: value }))
-    } catch (err) {
-      console.error('Não consegui salvar o modo:', err)
-    }
-  }
-
-  let mode = loadMode()
-  const canRun = (m) => mode === 'publico' || isSelf(m)
+  process.on('uncaughtException', (err) => {
+    if (isFsyncPermError(err)) return
+    console.error('Exceção não tratada:', err)
+  })
 
   // ---------- Conexão ----------
   client.on('connection', (u) => {
@@ -256,7 +266,7 @@ if (!isMainThread) {
     }
 
     if (u.state === 'open') {
-      console.log('✅ Bot online como', client.me?.id, `(modo ${mode})`)
+      console.log('✅ Bot online como', client.me?.id)
     }
 
     if (u.state === 'close') {
@@ -278,8 +288,6 @@ if (!isMainThread) {
 
   const isSelf = (m) => !!m.fromMe || isMe(m.sender)
 
-  const isOwner = (m) => isSelf(m) || OWNERS.includes(numberOf(m.sender))
-
   function chatOf(m) {
     const chat = m.chat
     const me = client.me
@@ -291,12 +299,6 @@ if (!isMainThread) {
 
   async function say(m, content) {
     return client.send(chatOf(m), typeof content === 'string' ? { text: content } : content, { quoted: m.asQuoted })
-  }
-
-  async function requireOwner(m) {
-    if (isOwner(m)) return true
-    await say(m, 'Esse comando é só para o dono do bot.')
-    return false
   }
 
   const formatTime = (seconds) => `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}`
@@ -822,6 +824,114 @@ if (!isMainThread) {
     await say(m, `Esse comando não funciona no modo direto. Use ${PREFIX}stop para parar a música.`)
   }
 
+  // ---------- /caption ----------
+  const looksLikeImage = (x) => {
+    if (!x) return false
+    const mime = String(x.mimetype ?? x.mime ?? x.msg?.mimetype ?? '').toLowerCase()
+    const type = String(x.mtype ?? x.type ?? x.messageType ?? '').toLowerCase()
+    return mime.startsWith('image/') || type.includes('image')
+  }
+
+  async function downloadFrom(x) {
+    const attempts = [
+      () => x.download?.(),
+      () => x.downloadMedia?.(),
+      () => client.downloadMedia?.(x),
+      () => client.downloadMedia?.(x.raw ?? x.message ?? x),
+      () => client.download?.(x),
+    ]
+    let lastErr
+    for (const attempt of attempts) {
+      try {
+        const out = await attempt()
+        if (Buffer.isBuffer(out) && out.length) return out
+        if (out instanceof Uint8Array && out.length) return Buffer.from(out)
+      } catch (err) {
+        lastErr = err
+      }
+    }
+    if (lastErr) console.error('Falha ao baixar imagem do WhatsApp:', lastErr)
+    return null
+  }
+
+  async function getImageBuffer(m) {
+    const sources = [m.quoted, m].filter(looksLikeImage)
+    if (!sources.length) return null
+    for (const src of sources) {
+      const buffer = await downloadFrom(src)
+      if (buffer) return buffer
+    }
+    return null
+  }
+
+  async function uploadToImgbb(buffer) {
+    if (!IMGBB_KEY || IMGBB_KEY.startsWith('COLOQUE')) {
+      throw new UserError('A chave do imgbb não foi configurada no código (IMGBB_KEY).')
+    }
+    const body = new URLSearchParams({ image: buffer.toString('base64') })
+    const res = await fetch(`${IMGBB_URL}?key=${encodeURIComponent(IMGBB_KEY)}&expiration=600`, {
+      method: 'POST',
+      body,
+      signal: AbortSignal.timeout(60_000),
+    })
+    const data = await res.json().catch(() => null)
+    const url = data?.data?.url
+    if (!res.ok || !data?.success || typeof url !== 'string') {
+      throw new UserError(`Não consegui enviar a imagem para o imgbb${data?.error?.message ? `: ${data.error.message}` : ` (erro ${res.status})`}.`)
+    }
+    return url
+  }
+
+  async function renderCaption(imageUrl, text) {
+    const url =
+      `${CAPTION_API_URL}?image=${encodeURIComponent(imageUrl)}` +
+      `&text=${encodeURIComponent(text)}&bottom=false&dark=false&fontsize=70`
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(60_000),
+      headers: { 'user-agent': USER_AGENT },
+    })
+    if (!res.ok) throw new UserError(`A API de caption respondeu com erro (${res.status}).`)
+
+    const type = String(res.headers.get('content-type') || '').toLowerCase()
+    if (type.startsWith('image/')) return Buffer.from(await res.arrayBuffer())
+
+    const data = await res.json().catch(() => null)
+    const link = data?.message?.url ?? data?.url ?? data?.image ?? data?.result
+    if (typeof link !== 'string' || !/^https?:\/\//.test(link)) {
+      throw new UserError(`A API de caption não devolveu uma imagem${data?.error ? `: ${data.error}` : ''}.`)
+    }
+    const img = await fetch(link, { signal: AbortSignal.timeout(60_000), headers: { 'user-agent': USER_AGENT } })
+    if (!img.ok) throw new UserError(`Não consegui baixar a imagem final (erro ${img.status}).`)
+    return Buffer.from(await img.arrayBuffer())
+  }
+
+  async function captionCmd(m, args) {
+    const text = args.join(' ').trim()
+    if (!text) {
+      await say(m, `Responda uma imagem com: ${PREFIX}caption seu texto aqui`)
+      return
+    }
+    if (text.length > CAPTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${CAPTION_MAX_CHARS} caracteres).`)
+      return
+    }
+
+    const image = await getImageBuffer(m)
+    if (!image) {
+      await say(m, `Responda uma imagem com ${PREFIX}caption texto, ou envie a imagem com ${PREFIX}caption texto na legenda.`)
+      return
+    }
+    if (image.length > CAPTION_MAX_IMAGE_BYTES) {
+      await say(m, 'A imagem é grande demais.')
+      return
+    }
+
+    await say(m, '🖼️ Criando a legenda…')
+    const link = await uploadToImgbb(image)
+    const result = await renderCaption(link, text)
+    await say(m, { image: result, caption: '✅ Pronto!' })
+  }
+
   // ---------- Comandos ----------
   async function handleCommand(m, command, args) {
     switch (command) {
@@ -829,11 +939,8 @@ if (!isMainThread) {
       case 'help':
       case 'ajuda':
       case 'comandos':
-      case 'start':
-      const menuText = `
-
-👀 ZizysBot – *${m.pushName}*
-_Um bot que toca músicas em call do WhatsApp._
+      case 'start': {
+        const menuText = `👀 ZizysBot – *${m.pushName}*
    
 Comando: *${PREFIX}play <música>*
 Busca a música e toca na ligação.
@@ -853,31 +960,22 @@ Para a música e o bot sai da chamada.
 Comando: *${PREFIX}fila*
 Mostra a música atual e a fila.
 
-> Desenvolvido por *${CREDITS}*
-> Link desse projeto (GitHub): https://github.com/maurikkkkj/ZizysBot
-
-`
-await say(m, menuText)
-break
+Comando: *${PREFIX}caption <texto>*
+Colocar legenda em alguma imagem.`
+        await say(m, menuText)
+        break
+      }
 
       case 'oi':
         await say(m, 'opa')
         break
 
-      case 'self':
-        if (!(await requireOwner(m))) break
-        saveMode('self')
-        await say(m, 'Modo self ativado: só o número do bot executa comandos.')
-        break
-
-      case 'publico':
-        if (!(await requireOwner(m))) break
-        saveMode('publico')
-        await say(m, 'Modo público ativado: todos podem executar comandos.')
-        break
-
       case 'play':
         await playCmd(m, args)
+        break
+
+      case 'caption':
+        await captionCmd(m, args)
         break
 
       case 'pause':
@@ -916,7 +1014,6 @@ break
     try {
       m = serialize(client, raw)
 
-      if (!canRun(m)) return
       if (Date.now() / 1000 - m.timestamp > MAX_MESSAGE_AGE_SECONDS) return
       if (!m.text.startsWith(PREFIX)) return
 
@@ -926,7 +1023,7 @@ break
       await handleCommand(m, word.toLowerCase(), args)
     } catch (err) {
       console.error('Erro ao tratar mensagem:', err)
-      if (m && canRun(m)) {
+      if (m) {
         const msg = err instanceof UserError ? err.message : `Não consegui executar o comando: ${err?.message ?? err}`
         await say(m, msg).catch(() => {})
       }
