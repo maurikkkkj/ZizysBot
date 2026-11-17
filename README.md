@@ -1,5 +1,5 @@
 # 👀 ZizysBot
-Um bot que toca músicas em call do WhatsApp
+Um bot que toca músicas em call do WhatsApp + Comandos que na minha opinião é divertido;)
 
 ---
 ## 📦 Instalação + Execução
