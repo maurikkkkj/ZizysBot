@@ -41,6 +41,8 @@ const IMGBB_URL = 'https://api.imgbb.com/1/upload'
 const CAPTION_API_URL = 'https://api.popcat.xyz/v2/caption'
 const CAPTION_MAX_CHARS = 200
 const CAPTION_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+const POPCAT_BASE = 'https://api.popcat.xyz/v2'
+const BRASILIA_OFFSET_MS = -3 * 60 * 60_000
 const MEDIA_DIR = 'media'
 const MAX_DURATION = Math.min(Math.max(Number(process.env.MAX_DURACAO) || 600, 10), 3600)
 const KEEP_AUDIOS = process.env.MANTER_AUDIOS === 'true'
@@ -932,6 +934,192 @@ if (!isMainThread) {
     await say(m, { image: result, caption: '✅ Pronto!' })
   }
 
+  // ---------- Comandos popcat (imagem e texto) ----------
+  const popcatUrl = (endpoint, params) => `${POPCAT_BASE}/${endpoint}?${new URLSearchParams(params).toString()}`
+
+  async function popcatRequest(url) {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(60_000),
+      headers: { 'user-agent': USER_AGENT },
+    })
+    if (!res.ok) throw new UserError(`A API respondeu com erro (${res.status}).`)
+
+    const type = String(res.headers.get('content-type') || '').toLowerCase()
+    if (type.startsWith('image/')) return { image: Buffer.from(await res.arrayBuffer()) }
+
+    const data = await res.json().catch(() => null)
+    if (!data || data.error) {
+      throw new UserError(`A API não devolveu um resultado${data?.message && typeof data.message === 'string' ? `: ${data.message}` : ''}.`)
+    }
+    return { data }
+  }
+
+  async function popcatImage(url) {
+    const out = await popcatRequest(url)
+    if (out.image) return out.image
+
+    const link = out.data?.message?.url ?? out.data?.url ?? out.data?.image ?? out.data?.result
+    if (typeof link !== 'string' || !/^https?:\/\//.test(link)) {
+      throw new UserError('A API não devolveu uma imagem.')
+    }
+    const img = await fetch(link, { signal: AbortSignal.timeout(60_000), headers: { 'user-agent': USER_AGENT } })
+    if (!img.ok) throw new UserError(`Não consegui baixar a imagem final (erro ${img.status}).`)
+    return Buffer.from(await img.arrayBuffer())
+  }
+
+  async function popcatText(url) {
+    const out = await popcatRequest(url)
+    const text = out.data?.message?.text
+    if (typeof text !== 'string' || !text.trim()) throw new UserError('A API não devolveu nenhum texto.')
+    return text
+  }
+
+  const splitParts = (args) =>
+    args
+      .join(' ')
+      .split('|')
+      .map((s) => s.trim())
+
+  async function textImageCmd(m, args, endpoint, usage) {
+    const text = args.join(' ').trim()
+    if (!text) {
+      await say(m, `Use: ${PREFIX}${usage}`)
+      return
+    }
+    if (text.length > CAPTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${CAPTION_MAX_CHARS} caracteres).`)
+      return
+    }
+    await say(m, '🖼️ Criando a imagem…')
+    const image = await popcatImage(popcatUrl(endpoint, { text }))
+    await say(m, { image, caption: '✅ Pronto!' })
+  }
+
+  async function textReplyCmd(m, args, endpoint, usage) {
+    const text = args.join(' ').trim()
+    if (!text) {
+      await say(m, `Use: ${PREFIX}${usage}`)
+      return
+    }
+    if (text.length > CAPTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${CAPTION_MAX_CHARS} caracteres).`)
+      return
+    }
+    const result = await popcatText(popcatUrl(endpoint, { text }))
+    await say(m, result)
+  }
+
+  async function imageLinkFrom(m, usage) {
+    const image = await getImageBuffer(m)
+    if (!image) {
+      await say(m, `Responda uma imagem com ${usage}, ou envie a imagem com ${usage} na legenda.`)
+      return null
+    }
+    if (image.length > CAPTION_MAX_IMAGE_BYTES) {
+      await say(m, 'A imagem é grande demais.')
+      return null
+    }
+    return uploadToImgbb(image)
+  }
+
+  async function imageOnlyCmd(m, endpoint, key, command, extra = {}) {
+    const usage = `${PREFIX}${command}`
+    if (!(await getImageBuffer(m).then((b) => !!b))) {
+      await say(m, `Responda uma imagem com ${usage}, ou envie a imagem com ${usage} na legenda.`)
+      return
+    }
+    await say(m, '🖼️ Criando a imagem…')
+    const link = await imageLinkFrom(m, usage)
+    if (!link) return
+    const image = await popcatImage(popcatUrl(endpoint, { [key]: link, ...extra }))
+    await say(m, { image, caption: '✅ Pronto!' })
+  }
+
+  async function gunCmd(m, args) {
+    const text = args.join(' ').trim()
+    if (!text) {
+      await say(m, `Responda uma imagem com: ${PREFIX}gun seu texto aqui`)
+      return
+    }
+    if (text.length > CAPTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${CAPTION_MAX_CHARS} caracteres).`)
+      return
+    }
+    const usage = `${PREFIX}gun texto`
+    if (!(await getImageBuffer(m).then((b) => !!b))) {
+      await say(m, `Responda uma imagem com ${usage}, ou envie a imagem com ${usage} na legenda.`)
+      return
+    }
+    await say(m, '🖼️ Criando a imagem…')
+    const link = await imageLinkFrom(m, usage)
+    if (!link) return
+    const image = await popcatImage(popcatUrl('gun', { image: link, text }))
+    await say(m, { image, caption: '✅ Pronto!' })
+  }
+
+  async function tweetCmd(m, args) {
+    const [name, username, ...rest] = splitParts(args)
+    const text = rest.join(' | ').trim()
+    const usage = `${PREFIX}tweet nome | username | texto`
+    if (!name || !username || !text) {
+      await say(m, `Responda uma imagem (será a foto de perfil) com: ${usage}`)
+      return
+    }
+    if (text.length > CAPTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${CAPTION_MAX_CHARS} caracteres).`)
+      return
+    }
+    if (!(await getImageBuffer(m).then((b) => !!b))) {
+      await say(m, `Responda uma imagem com: ${usage}`)
+      return
+    }
+    await say(m, '🐦 Criando o tweet…')
+    const link = await imageLinkFrom(m, usage)
+    if (!link) return
+    const image = await popcatImage(popcatUrl('tweet', { name, username: username.replace(/^@/, ''), text, pfp: link }))
+    await say(m, { image, caption: '✅ Pronto!' })
+  }
+
+  async function discordCmd(m, args) {
+    const [username, ...rest] = splitParts(args)
+    const content = rest.join(' | ').trim()
+    const usage = `${PREFIX}discord username | mensagem`
+    if (!username || !content) {
+      await say(m, `Responda uma imagem (será o avatar) com: ${usage}`)
+      return
+    }
+    if (content.length > CAPTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${CAPTION_MAX_CHARS} caracteres).`)
+      return
+    }
+    if (!(await getImageBuffer(m).then((b) => !!b))) {
+      await say(m, `Responda uma imagem com: ${usage}`)
+      return
+    }
+    await say(m, '💬 Criando a mensagem…')
+    const link = await imageLinkFrom(m, usage)
+    if (!link) return
+    const timestamp = new Date(Date.now() + BRASILIA_OFFSET_MS).toISOString().replace(/\.\d{3}Z$/, 'Z')
+    const image = await popcatImage(popcatUrl('discord-message', { username, content, avatar: link, color: '#ffcc99', timestamp }))
+    await say(m, { image, caption: '✅ Pronto!' })
+  }
+
+  async function poohCmd(m, args) {
+    const [text1, ...rest] = splitParts(args)
+    const text2 = rest.join(' | ').trim()
+    if (!text1 || !text2) {
+      await say(m, `Use: ${PREFIX}pooh texto 1 | texto 2`)
+      return
+    }
+    if (text1.length > CAPTION_MAX_CHARS || text2.length > CAPTION_MAX_CHARS) {
+      await say(m, `O texto é grande demais (máximo de ${CAPTION_MAX_CHARS} caracteres).`)
+      return
+    }
+    await say(m, '🖼️ Criando a imagem…')
+    const image = await popcatImage(popcatUrl('pooh', { text1, text2 }))
+    await say(m, { image, caption: '✅ Pronto!' })
+  }
+
   // ---------- Comandos ----------
   async function handleCommand(m, command, args) {
     switch (command) {
@@ -961,7 +1149,55 @@ Comando: *${PREFIX}fila*
 Mostra a música atual e a fila.
 
 Comando: *${PREFIX}caption <texto>*
-Colocar legenda em alguma imagem.`
+Colocar legenda em alguma imagem.
+
+Comando: *${PREFIX}tweet <nome> | <username> | <texto>*
+Gera um tweet falso realista com nome, username, foto e texto. Responda uma imagem para ser a foto de perfil.
+
+Comando: *${PREFIX}archi <texto>*
+Gera uma conquista no estilo do Minecraft com o seu texto.
+
+Comando: *${PREFIX}emojip <texto>*
+Transforma o seu texto numa bagunça engraçada de emojis.
+
+Comando: *${PREFIX}discord <username> | <mensagem>*
+Gera uma mensagem falsa do Discord. Responda uma imagem para ser o avatar.
+
+Comando: *${PREFIX}could <texto>*
+"Se essas crianças soubessem ler, ficariam muito chateadas."
+
+Comando: *${PREFIX}supreme <texto>*
+Gera a icônica logo da Supreme com o seu texto.
+
+Comando: *${PREFIX}hue*
+Gira a tonalidade (hue) de uma imagem. Responda uma imagem ou envie com o comando.
+
+Comando: *${PREFIX}nokia*
+Coloca a sua imagem na tela de um Nokia. Responda uma imagem ou envie com o comando.
+
+Comando: *${PREFIX}cadeia*
+Coloca grades de cadeia sobre a imagem. Responda uma imagem ou envie com o comando.
+
+Comando: *${PREFIX}sadcat <texto>*
+Cria um meme do gato triste.
+
+Comando: *${PREFIX}oogway <texto>*
+Cria um meme de "citação do Mestre Oogway".
+
+Comando: *${PREFIX}comunismo*
+Coloca um efeito comunista sobre a imagem. Responda uma imagem ou envie com o comando.
+
+Comando: *${PREFIX}pooh <texto 1> | <texto 2>*
+Cria um meme do Pooh normal e de smoking.
+
+Comando: *${PREFIX}procurado*
+Cria um cartaz falso de "procurado" com a sua imagem. Responda uma imagem ou envie com o comando.
+
+Comando: *${PREFIX}gun <texto>*
+Coloca uma arma sobre a imagem com o texto. Responda uma imagem ou envie com o comando.
+
+Comando: *${PREFIX}mock <texto>*
+Transforma o texto em tom sarcástico.`
         await say(m, menuText)
         break
       }
@@ -976,6 +1212,70 @@ Colocar legenda em alguma imagem.`
 
       case 'caption':
         await captionCmd(m, args)
+        break
+
+      case 'tweet':
+        await tweetCmd(m, args)
+        break
+
+      case 'archi':
+        await textImageCmd(m, args, 'achievement', 'archi texto')
+        break
+
+      case 'emojip':
+        await textReplyCmd(m, args, 'emojipasta', 'emojip texto')
+        break
+
+      case 'discord':
+        await discordCmd(m, args)
+        break
+
+      case 'could':
+        await textImageCmd(m, args, 'couldread', 'could texto')
+        break
+
+      case 'supreme':
+        await textImageCmd(m, args, 'supreme', 'supreme texto')
+        break
+
+      case 'hue':
+        await imageOnlyCmd(m, 'hue-rotate', 'img', 'hue', { deg: '120' })
+        break
+
+      case 'nokia':
+        await imageOnlyCmd(m, 'nokia', 'image', 'nokia')
+        break
+
+      case 'cadeia':
+        await imageOnlyCmd(m, 'jail', 'image', 'cadeia')
+        break
+
+      case 'sadcat':
+        await textImageCmd(m, args, 'sadcat', 'sadcat texto')
+        break
+
+      case 'oogway':
+        await textImageCmd(m, args, 'oogway', 'oogway texto')
+        break
+
+      case 'comunismo':
+        await imageOnlyCmd(m, 'communism', 'image', 'comunismo')
+        break
+
+      case 'pooh':
+        await poohCmd(m, args)
+        break
+
+      case 'procurado':
+        await imageOnlyCmd(m, 'wanted', 'image', 'procurado')
+        break
+
+      case 'gun':
+        await gunCmd(m, args)
+        break
+
+      case 'mock':
+        await textReplyCmd(m, args, 'mock', 'mock texto')
         break
 
       case 'pause':
