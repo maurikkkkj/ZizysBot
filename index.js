@@ -348,10 +348,10 @@ if (!isMainThread) {
     return { title: String(result.title || 'áudio'), duration: Number(result.duration) || 0, url }
   }
 
-  function prepareInWorker(url) {
+  function prepareInWorker(url, direct = DIRECT_PLAY) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL(import.meta.url), {
-        workerData: { url, seconds: MAX_DURATION, nice: HAS_NICE, direct: DIRECT_PLAY },
+        workerData: { url, seconds: MAX_DURATION, nice: HAS_NICE, direct },
       })
       let settled = false
       worker.once('message', (msg) => {
@@ -759,6 +759,50 @@ if (!isMainThread) {
     }
   }
 
+  // ---------- /play2 (envia o áudio na conversa) ----------
+  const AUDIO_MIMES = {
+    mp3: 'audio/mpeg',
+    m4a: 'audio/mp4',
+    mp4: 'audio/mp4',
+    aac: 'audio/aac',
+    ogg: 'audio/ogg; codecs=opus',
+    opus: 'audio/ogg; codecs=opus',
+    wav: 'audio/wav',
+    webm: 'audio/webm',
+    flac: 'audio/flac',
+  }
+
+  async function play2Cmd(m, args) {
+    const query = args.join(' ').trim()
+    if (!query) {
+      await say(m, `Use: ${PREFIX}play2 nome da música  (ex: ${PREFIX}play2 Bad Boys)`)
+      return
+    }
+
+    await say(m, `🔎 Buscando: ${query}…`)
+
+    let file = null
+    activePrep++
+    try {
+      const info = await fetchAudioInfo(query)
+      if (info.duration && info.duration > MAX_DURATION) {
+        throw new UserError(`Essa música tem ${formatTime(info.duration)} e o limite é ${formatTime(MAX_DURATION)}.`)
+      }
+
+      await say(m, `⬇️ Baixando: ${info.title}`)
+      const prepared = await prepareInWorker(info.url, true)
+      file = prepared.file
+
+      const ext = path.extname(file).slice(1).toLowerCase()
+      const audio = fs.readFileSync(file)
+      await say(m, { audio, mimetype: AUDIO_MIMES[ext] || 'audio/mp4', ptt: false })
+      await say(m, `🎵 *${info.title}*${info.duration ? ` (${formatTime(info.duration)})` : ''}`)
+    } finally {
+      activePrep--
+      if (file && !KEEP_AUDIOS) fs.rmSync(file, { force: true })
+    }
+  }
+
   // ---------- Controles ----------
   async function needSession(m, allowUnstarted = false) {
     const s = byTarget.get(targetOf(m))
@@ -893,7 +937,7 @@ if (!isMainThread) {
   async function renderCaption(imageUrl, text) {
     const url =
       `${CAPTION_API_URL}?image=${encodeURIComponent(imageUrl)}` +
-      `&text=${encodeURIComponent(text)}&bottom=false&dark=false&fontsize=70`
+      `&text=${encodeURIComponent(text)}&bottom=false&dark=false&fontsize=50`
     const res = await fetch(url, {
       signal: AbortSignal.timeout(60_000),
       headers: { 'user-agent': USER_AGENT },
@@ -1210,19 +1254,6 @@ if (!isMainThread) {
       nothing: 'Esse membro não é admin do grupo.',
     })
 
-  async function reportCmd(m) {
-    if (!m.isGroup) {
-      await say(m, 'Esse comando só funciona em grupos.')
-      return
-    }
-    if (!m.quoted?.id) {
-      await say(m, `Responda a mensagem que você quer reportar com ${PREFIX}reportar`)
-      return
-    }
-    await client.reportToAdmins(m.chat, m.quoted.id)
-    await say(m, '🚨 Mensagem reportada para os admins do grupo.')
-  }
-
   const participantJid = (p) => {
     const jid = typeof p === 'string' ? p : p?.phoneNumber || p?.id
     if (!jid) return null
@@ -1309,7 +1340,7 @@ if (!isMainThread) {
       }
 
       const size = STICKER_SIZE
-      const fit = `scale=${size}:${size}:force_original_aspect_ratio=decrease,format=rgba,pad=${size}:${size}:(ow-iw)/2:(oh-ih)/2:color=#00000000`
+      const fit = `scale=${size}:${size}:flags=lanczos,setsar=1,format=rgba`
       const qualities = video ? [55, 40, 28, 18] : [80, 60, 40]
 
       for (const q of qualities) {
@@ -1354,6 +1385,9 @@ if (!isMainThread) {
    
 Comando: *${PREFIX}play <música>*
 Busca a música e toca na ligação.
+
+Comando: *${PREFIX}play2 <música>*
+Busca a música e envia o áudio na conversa.
 
 Comando: *${PREFIX}pause*
 Pausar uma música na ligação.
@@ -1424,9 +1458,6 @@ Transforma o texto em tom sarcástico.
 Comando: *${PREFIX}sticker*
 Cria uma figurinha de foto, vídeo ou gif (até ${STICKER_MAX_SECONDS}s). Responda a mídia ou envie com o comando.
 
-Comando: *${PREFIX}reportar*
-Reporta uma mensagem para os admins do grupo. Responda a mensagem que quer reportar.
-
 Comando: *${PREFIX}remover @membro*
 Remove um membro do grupo. Só admins. Marque o membro ou responda a mensagem dele.
 
@@ -1448,6 +1479,10 @@ Menciona todos os membros do grupo de forma invisível, mostrando só o texto. S
 
       case 'play':
         await playCmd(m, args)
+        break
+
+      case 'play2':
+        await play2Cmd(m, args)
         break
 
       case 'caption':
@@ -1533,10 +1568,6 @@ Menciona todos os membros do grupo de forma invisível, mostrando só o texto. S
 
       case 'rebaixar':
         await demoteCmd(m)
-        break
-
-      case 'reportar':
-        await reportCmd(m)
         break
 
       case 'mencionar':
