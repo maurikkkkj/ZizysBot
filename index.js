@@ -1468,7 +1468,10 @@ Comando: *${PREFIX}rebaixar @membro*
 Tira o admin de um membro do grupo. Só admins. Marque o membro ou responda a mensagem dele.
 
 Comando: *${PREFIX}mencionar <texto>*
-Menciona todos os membros do grupo de forma invisível, mostrando só o texto. Só admins.`
+Menciona todos os membros do grupo de forma invisível, mostrando só o texto. Só admins.
+
+> Desenvolvido por mauri (Esse projeto é OpenSource)
+> Source: https://github.com/maurikkkkj/ZizysBot`
         await say(m, menuText)
         break
       }
