@@ -1470,8 +1470,8 @@ Tira o admin de um membro do grupo. Só admins. Marque o membro ou responda a me
 Comando: *${PREFIX}mencionar <texto>*
 Menciona todos os membros do grupo de forma invisível, mostrando só o texto. Só admins.
 
-> Desenvolvido por mauri (Esse projeto é OpenSource)
-> Source: https://github.com/maurikkkkj/ZizysBot`
+> Desenvolvido por mauri (Projeto OpenSource)
+> SC: https://github.com/maurikkkkj/ZizysBot`
         await say(m, menuText)
         break
       }
