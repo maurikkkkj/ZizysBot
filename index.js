@@ -669,7 +669,7 @@ if (!isMainThread) {
   }
 
   async function startSession(m, target, track) {
-    const audioOpts = DIRECT_PLAY ? { audioFile: path.resolve(track.file) } : undefined
+    const audioOpts = DIRECT_PLAY ? { audioFile: path.resolve(track.file), sampleRate: 48000 } : undefined
     if (m.isGroup) {
       const joinable = findJoinableGroupCall(target)
       if (joinable) {
